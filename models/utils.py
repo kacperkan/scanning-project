@@ -1,13 +1,12 @@
 import gc
 from collections import defaultdict
 
+import tinycudann as tcnn
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Function
 from torch.cuda.amp import custom_bwd, custom_fwd
-
-import tinycudann as tcnn
 
 
 def chunk_batch(func, chunk_size, move_to_cpu, *args, **kwargs):
@@ -19,7 +18,17 @@ def chunk_batch(func, chunk_size, move_to_cpu, *args, **kwargs):
     out = defaultdict(list)
     out_type = None
     for i in range(0, B, chunk_size):
-        out_chunk = func(*[arg[i:i+chunk_size] if isinstance(arg, torch.Tensor) else arg for arg in args], **kwargs)
+        out_chunk = func(
+            *[
+                (
+                    arg[i : i + chunk_size]
+                    if isinstance(arg, torch.Tensor)
+                    else arg
+                )
+                for arg in args
+            ],
+            **kwargs,
+        )
         if out_chunk is None:
             continue
         out_type = type(out_chunk)
@@ -31,13 +40,15 @@ def chunk_batch(func, chunk_size, move_to_cpu, *args, **kwargs):
         elif isinstance(out_chunk, dict):
             pass
         else:
-            print(f'Return value of func must be in type [torch.Tensor, list, tuple, dict], get {type(out_chunk)}.')
+            print(
+                f"Return value of func must be in type [torch.Tensor, list, tuple, dict], get {type(out_chunk)}."
+            )
             exit(1)
         for k, v in out_chunk.items():
             v = v if torch.is_grad_enabled() else v.detach()
             v = v.cpu() if move_to_cpu else v
             out[k].append(v)
-    
+
     if out_type is None:
         return
 
@@ -65,6 +76,7 @@ class _TruncExp(Function):  # pylint: disable=abstract-method
         x = ctx.saved_tensors[0]
         return g * torch.exp(torch.clamp(x, max=15))
 
+
 trunc_exp = _TruncExp.apply
 
 
@@ -72,33 +84,38 @@ def get_activation(name):
     if name is None:
         return lambda x: x
     name = name.lower()
-    if name == 'none':
+    if name == "none":
         return lambda x: x
-    elif name.startswith('scale'):
+    elif name.startswith("scale"):
         scale_factor = float(name[5:])
-        return lambda x: x.clamp(0., scale_factor) / scale_factor
-    elif name.startswith('clamp'):
+        return lambda x: x.clamp(0.0, scale_factor) / scale_factor
+    elif name.startswith("clamp"):
         clamp_max = float(name[5:])
-        return lambda x: x.clamp(0., clamp_max)
-    elif name.startswith('mul'):
+        return lambda x: x.clamp(0.0, clamp_max)
+    elif name.startswith("mul"):
         mul_factor = float(name[3:])
         return lambda x: x * mul_factor
-    elif name == 'lin2srgb':
-        return lambda x: torch.where(x > 0.0031308, torch.pow(torch.clamp(x, min=0.0031308), 1.0/2.4)*1.055 - 0.055, 12.92*x).clamp(0., 1.)
-    elif name == 'trunc_exp':
+    elif name == "lin2srgb":
+        return lambda x: torch.where(
+            x > 0.0031308,
+            torch.pow(torch.clamp(x, min=0.0031308), 1.0 / 2.4) * 1.055
+            - 0.055,
+            12.92 * x,
+        ).clamp(0.0, 1.0)
+    elif name == "trunc_exp":
         return trunc_exp
-    elif name.startswith('+') or name.startswith('-'):
+    elif name.startswith("+") or name.startswith("-"):
         return lambda x: x + float(name)
-    elif name == 'sigmoid':
+    elif name == "sigmoid":
         return lambda x: torch.sigmoid(x)
-    elif name == 'tanh':
+    elif name == "tanh":
         return lambda x: torch.tanh(x)
     else:
         return getattr(F, name)
 
 
 def dot(x, y):
-    return torch.sum(x*y, -1, keepdim=True)
+    return torch.sum(x * y, -1, keepdim=True)
 
 
 def reflect(x, n):
@@ -108,7 +125,7 @@ def reflect(x, n):
 def scale_anything(dat, inp_scale, tgt_scale):
     if inp_scale is None:
         inp_scale = [dat.min(), dat.max()]
-    dat = (dat  - inp_scale[0]) / (inp_scale[1] - inp_scale[0])
+    dat = (dat - inp_scale[0]) / (inp_scale[1] - inp_scale[0])
     dat = dat * (tgt_scale[1] - tgt_scale[0]) + tgt_scale[0]
     return dat
 

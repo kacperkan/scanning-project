@@ -5,6 +5,7 @@ def register(name):
     def decorator(cls):
         models[name] = cls
         return cls
+
     return decorator
 
 
@@ -13,4 +14,4 @@ def make(name, config):
     return model
 
 
-from . import nerf, neus, geometry, texture
+from . import geometry, nerf, neus, texture

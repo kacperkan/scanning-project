@@ -5,6 +5,7 @@ def register(name):
     def decorator(cls):
         datasets[name] = cls
         return cls
+
     return decorator
 
 
