@@ -70,7 +70,8 @@ class SSIM:
 
         if any(x % 2 == 0 or x <= 0 for x in self.kernel_size):
             raise ValueError(
-                f"Expected kernel_size to have odd positive number. Got {kernel_size}."
+                "Expected kernel_size to have odd positive number. Got"
+                f" {kernel_size}."
             )
         if any(y <= 0 for y in self.sigma):
             raise ValueError(
@@ -119,17 +120,20 @@ class SSIM:
     def __call__(self, output, target, reduction="mean"):
         if output.dtype != target.dtype:
             raise TypeError(
-                f"Expected output and target to have the same data type. Got output: {output.dtype} and y: {target.dtype}."
+                "Expected output and target to have the same data type. Got"
+                f" output: {output.dtype} and y: {target.dtype}."
             )
 
         if output.shape != target.shape:
             raise ValueError(
-                f"Expected output and target to have the same shape. Got output: {output.shape} and y: {target.shape}."
+                "Expected output and target to have the same shape. Got"
+                f" output: {output.shape} and y: {target.shape}."
             )
 
         if len(output.shape) != 4 or len(target.shape) != 4:
             raise ValueError(
-                f"Expected output and target to have BxCxHxW shape. Got output: {output.shape} and y: {target.shape}."
+                "Expected output and target to have BxCxHxW shape. Got"
+                f" output: {output.shape} and y: {target.shape}."
             )
 
         assert reduction in ["mean", "sum", "none"]

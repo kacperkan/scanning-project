@@ -212,7 +212,10 @@ class NeRFSystem(BaseSystem):
                 },
             ],
         )
-        return {"psnr": psnr, "index": batch["index"]}
+
+        self.__validation_outputs.append(
+            {"psnr": psnr, "index": batch["index"]}
+        )
 
     """
     # aggregate outputs from different devices when using DP
@@ -220,8 +223,11 @@ class NeRFSystem(BaseSystem):
         pass
     """
 
-    def validation_epoch_end(self, out):
-        out = self.all_gather(out)
+    def on_validation_epoch_start(self):
+        self.__validation_outputs = []
+
+    def on_validation_epoch_end(self):
+        out = self.all_gather(self.__validation_outputs)
         if self.trainer.is_global_zero:
             out_set = {}
             for step_out in out:
@@ -240,6 +246,8 @@ class NeRFSystem(BaseSystem):
                 torch.stack([o["psnr"] for o in out_set.values()])
             )
             self.log("val/psnr", psnr, prog_bar=True, rank_zero_only=True)
+
+        self.__validation_outputs.clear()
 
     def test_step(self, batch, batch_idx):
         out = self(batch)
@@ -272,10 +280,13 @@ class NeRFSystem(BaseSystem):
                 },
             ],
         )
-        return {"psnr": psnr, "index": batch["index"]}
+        self.__test_results.append({"psnr": psnr, "index": batch["index"]})
 
-    def test_epoch_end(self, out):
-        out = self.all_gather(out)
+    def on_test_epoch_start(self):
+        self.__test_results = []
+
+    def on_test_epoch_end(self):
+        out = self.all_gather(self.__test_results)
         if self.trainer.is_global_zero:
             out_set = {}
             for step_out in out:
@@ -304,6 +315,8 @@ class NeRFSystem(BaseSystem):
             )
 
             self.export()
+
+        self.__test_results.clear()
 
     def export(self):
         mesh = self.model.export(self.config.export)

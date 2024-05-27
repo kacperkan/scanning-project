@@ -1,12 +1,23 @@
+import enum
 import gc
 from collections import defaultdict
+from typing import Dict, Iterator
 
+import numpy as np
 import tinycudann as tcnn
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from jaxtyping import Float, Int32
 from torch.autograd import Function
 from torch.cuda.amp import custom_bwd, custom_fwd
+
+
+class ContractionType(enum.Enum):
+    NONE = enum.auto()
+    AABB = enum.auto()
+    UN_BOUNDED_SPHERE = enum.auto()
+    TANH = enum.auto()
 
 
 def chunk_batch(func, chunk_size, move_to_cpu, *args, **kwargs):
@@ -41,7 +52,8 @@ def chunk_batch(func, chunk_size, move_to_cpu, *args, **kwargs):
             pass
         else:
             print(
-                f"Return value of func must be in type [torch.Tensor, list, tuple, dict], get {type(out_chunk)}."
+                "Return value of func must be in type [torch.Tensor, list,"
+                f" tuple, dict], get {type(out_chunk)}."
             )
             exit(1)
         for k, v in out_chunk.items():
@@ -134,3 +146,390 @@ def cleanup():
     gc.collect()
     torch.cuda.empty_cache()
     tcnn.free_temporary_memory()
+
+
+class Constants:
+    LATENT_DIM = 8
+
+
+class Features(enum.Enum):
+    ALPHA = enum.auto()
+    BETA = enum.auto()
+    SLOPE = enum.auto()
+    DENSITY = enum.auto()
+    NORMALS = enum.auto()
+    RGB = enum.auto()
+    VERTEX_ALPHA = enum.auto()  # from DMTet
+    LATENT_FEATS = enum.auto()
+
+    @property
+    def dim(self) -> int:
+        if self == Features.ALPHA:
+            return 1
+        if self == Features.BETA:
+            return 1
+        if self == Features.SLOPE:
+            return 1
+        if self == Features.DENSITY:
+            return 1
+        if self == Features.NORMALS:
+            return 3
+        if self == Features.RGB:
+            return 3
+        if self == Features.VERTEX_ALPHA:
+            return 1
+        if self == Features.LATENT_FEATS:
+            return Constants.LATENT_DIM
+
+    @staticmethod
+    def from_str(a_str: str) -> "Features":
+        if a_str == "alpha":
+            return Features.ALPHA
+        if a_str == "beta":
+            return Features.BETA
+        if a_str == "slope":
+            return Features.SLOPE
+        if a_str == "density":
+            return Features.DENSITY
+        if a_str == "normals":
+            return Features.NORMALS
+        if a_str == "rgb":
+            return Features.RGB
+        if a_str == "vertex_alpha":
+            return Features.VERTEX_ALPHA
+        if a_str == "latent_feats":
+            return Features.LATENT_FEATS
+
+    def get_num_features(self, rgb_basis_dim: int) -> int:
+        if self == Features.RGB:
+            return (rgb_basis_dim + 1) ** 2 * self.dim
+        return self.dim
+
+    def get_slice(
+        self, feats_to_encode: list["Features"], rgb_basis_dim: int
+    ) -> slice:
+        start = 0
+        for feat in feats_to_encode:
+            if feat == self:
+                return slice(
+                    start, start + feat.get_num_features(rgb_basis_dim)
+                )
+            start += feat.get_num_features(rgb_basis_dim)
+        raise ValueError(f"Feature {self} not found in {feats_to_encode}")
+
+    @staticmethod
+    def get_all_num_features(
+        list_of_feats: list["Features"], rgb_basis_dim: int
+    ) -> int:
+        total = 0
+        for feat in list_of_feats:
+            total += feat.get_num_features(rgb_basis_dim)
+        return total
+
+
+def beta_activation(
+    betas: Float[torch.Tensor, "... 1"],
+) -> Float[torch.Tensor, "... 1"]:
+    return nn.functional.softplus(betas - 2.3)
+
+
+def extract_voxel_params(
+    shape_feats: Float[torch.Tensor, "... shape_dim"],
+    feats_to_encode: list[Features],
+    rgb_basis_dim: int,
+) -> Dict[Features, Float[torch.Tensor, "... dim"]]:
+
+    output_dict = {}
+
+    def add_to_dict_if_exists(feat: Features):
+        if feat in feats_to_encode:
+            output_dict[feat] = shape_feats[
+                ..., feat.get_slice(feats_to_encode, rgb_basis_dim)
+            ]
+
+    for feat in feats_to_encode:
+        add_to_dict_if_exists(feat)
+
+    return output_dict
+
+
+def bcc_mesh(
+    res: int, chunk_size: int
+) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+    p1s_odd = (
+        torch.stack(
+            torch.meshgrid(
+                torch.arange(-1, res * 2, 2),
+                torch.arange(-1, res * 2, 2),
+                torch.arange(-1, res, 2),
+            ),
+            dim=-1,
+        )
+        .float()
+        .view((-1, 3))
+    )
+    p1s_even = (
+        torch.stack(
+            torch.meshgrid(
+                torch.arange(0, res * 2, 2),
+                torch.arange(0, res * 2, 2),
+                torch.arange(0, res, 2),
+            ),
+            dim=-1,
+        )
+        .float()
+        .view((-1, 3))
+    )
+
+    p1 = torch.cat([p1s_odd, p1s_even], dim=0)
+    vec3 = lambda *val: torch.tensor(val, device=p1.device, dtype=p1.dtype)
+
+    p1_all = p1
+    offset = 0
+
+    multipliers = torch.tensor([0.5, 0.5, 1.0])
+    diff = torch.tensor([-1.0, -1.0, 0.0])
+
+    def get_verts_edges_and_updated_offset(p, offset):
+        tet_coords = torch.stack(p, dim=1)
+
+        # volumes = (
+        #     (
+        #         torch.cross(
+        #             tet_coords[:, 1] - tet_coords[:, 0],
+        #             tet_coords[:, 2] - tet_coords[:, 0],
+        #         )
+        #         * (tet_coords[:, 3] - tet_coords[:, 0])
+        #     )
+        #     .sum(dim=-1)
+        #     .abs()
+        # )
+
+        # keep_tets_mask = volumes == 4
+        # tet_coords = tet_coords[keep_tets_mask]
+
+        vertices = tet_coords.view(-1, 3)
+
+        edges = []
+        indices = torch.arange(len(tet_coords)) * 4  #  + offset
+        # don't add offset because later in the code we process it sequentially
+
+        edges1 = torch.stack([indices + 0, indices + 1, indices + 2], dim=-1)
+        edges2 = torch.stack([indices + 1, indices + 2, indices + 3], dim=-1)
+        edges3 = torch.stack([indices + 2, indices + 3, indices + 0], dim=-1)
+        edges4 = torch.stack([indices + 3, indices + 0, indices + 1], dim=-1)
+
+        edges = (
+            torch.stack([edges1, edges2, edges3, edges4], dim=1).view((-1, 3))
+            + offset
+        )
+        offset += len(tet_coords) * 4
+
+        # mask = (tet_coords[..., [2]] % 2 == 1).float()
+        # tet_coords = ((tet_coords + diff) * mask) + tet_coords * (1 - mask)
+
+        return tet_coords, edges, offset
+
+    for p1 in torch.split(p1_all, chunk_size):
+        p2 = p1 + 1.0
+
+        p3 = p1 + vec3(1.0, 1.0, -1.0)
+        p4 = p1 + vec3(2.0, 0.0, 0.0)
+
+        tet_coords, edges, offset = get_verts_edges_and_updated_offset(
+            (p1, p2, p3, p4), offset
+        )
+
+        yield tet_coords, edges
+
+        p3 = p1 + vec3(1.0, 1.0, -1.0)
+        p4 = p1 + vec3(0.0, 2.0, 0.0)
+
+        tet_coords, edges, offset = get_verts_edges_and_updated_offset(
+            (p1, p2, p3, p4), offset
+        )
+
+        yield tet_coords, edges
+
+        p3 = p1 + vec3(-1.0, 1.0, 1.0)
+        p4 = p1 + vec3(0.0, 2.0, 0.0)
+        tet_coords, edges, offset = get_verts_edges_and_updated_offset(
+            (p1, p2, p3, p4), offset
+        )
+
+        yield tet_coords, edges
+
+        p3 = p1 + vec3(1.0, -1.0, 1.0)
+        p4 = p1 + vec3(2.0, 0.0, 0.0)
+        tet_coords, edges, offset = get_verts_edges_and_updated_offset(
+            (p1, p2, p3, p4), offset
+        )
+
+        yield tet_coords, edges
+
+        p3 = p1 + vec3(1.0, -1.0, 1.0)
+        p4 = p1 + vec3(0.0, 0.0, 2.0)
+        tet_coords, edges, offset = get_verts_edges_and_updated_offset(
+            (p1, p2, p3, p4), offset
+        )
+
+        yield tet_coords, edges
+
+        p3 = p1 + vec3(-1.0, 1.0, 1.0)
+        p4 = p1 + vec3(0.0, 0.0, 2.0)
+        tet_coords, edges, offset = get_verts_edges_and_updated_offset(
+            (p1, p2, p3, p4), offset
+        )
+
+        yield tet_coords, edges
+
+
+def yet_another_meshing(
+    res: int,
+) -> tuple[Float[torch.Tensor, "n_verts 3"], Int32[torch.Tensor, "n_faces 3"]]:
+    main_vertices = (
+        np.stack(
+            np.meshgrid(
+                np.arange(0, res // 2),
+                np.arange(0, res // 2),
+                np.arange(0, res // 2),
+                indexing="ij",
+            ),
+            axis=-1,
+        )
+        * 2
+    )
+    main_vertices = main_vertices.reshape((-1, 3)).tolist()
+
+    edges = []
+    triangles = []
+    half_res = res // 2
+    for i in range(half_res):
+        for j in range(half_res):
+            for k in range(half_res):
+                offset = i * half_res**2 + j * half_res + k
+                if k < half_res - 1:
+                    edges.append((offset, offset + 1))
+                if j < half_res - 1:
+                    edges.append((offset, offset + half_res))
+                if i < half_res - 1:
+                    edges.append((offset, offset + half_res * half_res))
+
+    new_id = half_res**3
+
+    half_res_dec = half_res
+    for i in range(0, half_res_dec):
+        for j in range(0, half_res_dec):
+            for k in range(0, half_res_dec):
+                new_point = [i * 2 + 1, j * 2 + 1, k * 2 + 1]
+                main_vertices.append(new_point)
+                offset = i * half_res**2 + j * half_res + k
+
+                edges.append((new_id, offset))
+                if k < half_res - 1:
+                    edges.append((new_id, offset + 1))
+                    triangles.append((new_id, offset, offset + 1))
+                if j < half_res - 1:
+                    edges.append((new_id, offset + half_res))
+                    triangles.append((new_id, offset, offset + half_res))
+                if j < half_res - 1 and k < half_res - 1:
+                    edges.append((new_id, offset + half_res + 1))
+                    triangles.append(
+                        (new_id, offset + half_res, offset + half_res + 1)
+                    )
+                    triangles.append(
+                        (new_id, offset + 1, offset + half_res + 1)
+                    )
+
+                whole_row = half_res**2
+                offset += half_res**2
+                if i < half_res - 1:
+                    edges.append((new_id, offset))
+                    triangles.append((new_id, offset, offset - whole_row))
+                    if k < half_res - 1:
+                        edges.append((new_id, offset + 1))
+                        triangles.append((new_id, offset, offset + 1))
+                        triangles.append(
+                            (new_id, offset + 1 - whole_row, offset + 1)
+                        )
+                    if j < half_res - 1:
+                        edges.append((new_id, offset + half_res))
+                        triangles.append((new_id, offset, offset + half_res))
+                        triangles.append(
+                            (
+                                new_id,
+                                offset + half_res - whole_row,
+                                offset + half_res,
+                            )
+                        )
+                    if j < half_res - 1 and k < half_res - 1:
+                        edges.append((new_id, offset + half_res + 1))
+                        triangles.append(
+                            (new_id, offset + half_res, offset + half_res + 1)
+                        )
+                        triangles.append(
+                            (new_id, offset + 1, offset + half_res + 1)
+                        )
+
+                        triangles.append(
+                            (
+                                new_id,
+                                offset + half_res + 1 - whole_row,
+                                offset + half_res + 1,
+                            )
+                        )
+
+                offset -= whole_row
+                if k < half_res_dec - 1:
+                    edges.append((new_id, new_id + 1))
+                    triangles.append((new_id, new_id + 1, offset + 1))
+                if j < half_res_dec - 1:
+                    edges.append((new_id, new_id + half_res_dec))
+                    triangles.append(
+                        (new_id, new_id + half_res_dec, offset + half_res)
+                    )
+                if j < half_res - 1 and k < half_res - 1:
+                    triangles.append(
+                        (new_id, new_id + 1, offset + half_res + 1)
+                    )
+                    triangles.append(
+                        (new_id, new_id + half_res_dec, offset + half_res + 1)
+                    )
+                if i < half_res_dec - 1:
+                    lower_id = new_id + half_res_dec * half_res_dec
+                    edges.append((new_id, lower_id))
+
+                offset += whole_row
+                if i < half_res_dec - 1:
+                    triangles.append((new_id, lower_id, offset))
+                    if k < half_res_dec - 1:
+                        triangles.append((new_id, new_id + 1, offset + 1))
+                        triangles.append((new_id, lower_id, offset + 1))
+                    if j < half_res_dec - 1:
+                        triangles.append(
+                            (new_id, new_id + half_res_dec, offset + half_res)
+                        )
+                        triangles.append((new_id, lower_id, offset + half_res))
+                    if j < half_res - 1 and k < half_res - 1:
+                        triangles.append(
+                            (new_id, new_id + 1, offset + half_res + 1)
+                        )
+                        triangles.append(
+                            (
+                                new_id,
+                                new_id + half_res_dec,
+                                offset + half_res + 1,
+                            )
+                        )
+                        triangles.append(
+                            (new_id, lower_id, offset + half_res + 1)
+                        )
+
+                new_id += 1
+    vertices_array = np.array(main_vertices, dtype=np.float32)
+
+    vertices_tensor = torch.from_numpy(vertices_array)
+
+    triangles_array = np.array(triangles, dtype=np.int32)
+    triangles_tensor = torch.from_numpy(triangles_array).long()
+    return vertices_tensor, triangles_tensor

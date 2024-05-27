@@ -18,8 +18,8 @@ from models.utils import ContractionType, chunk_batch
 from systems.utils import update_module_step
 
 
-@models.register("neus")
-class NeuSModel(BaseModel):
+@models.register("bcc")
+class BCCModel(BaseModel):
     def setup(self):
         self.geometry = models.make(
             self.config.geometry.name, self.config.geometry
@@ -278,9 +278,18 @@ class NeuSModel(BaseModel):
             sdf, sdf_grad, feature = self.geometry(
                 positions, with_grad=True, with_feature=True
             )
+        eps = torch.finfo(sdf.dtype).eps
+        where_all_zeros = torch.where(sdf_grad.abs().sum(-1) < eps)
+        sdf_grad[where_all_zeros] = eps
         normal = F.normalize(sdf_grad, p=2, dim=-1)
         alpha = self.get_alpha(sdf, normal, t_dirs, dists)
-        rgb = self.texture(feature, t_dirs, normal)
+        # rgb = self.texture(positions, feature, t_dirs, normal)
+        rgb = self.texture(
+            positions,
+            feature,
+            torch.zeros_like(t_dirs),
+            torch.zeros_like(normal),
+        )
 
         weights, _ = render_weight_from_alpha(
             alpha, ray_indices=ray_indices, n_rays=n_rays
@@ -383,17 +392,18 @@ class NeuSModel(BaseModel):
     def export(self, export_config):
         mesh = self.isosurface()
         if export_config.export_vertex_color:
+            pos = mesh["v_pos"].to(self.rank)
             _, sdf_grad, feature = chunk_batch(
                 self.geometry,
                 export_config.chunk_size,
                 False,
-                mesh["v_pos"].to(self.rank),
+                pos,
                 with_grad=True,
                 with_feature=True,
             )
             normal = F.normalize(sdf_grad, p=2, dim=-1)
             rgb = self.texture(
-                feature, -normal, normal
+                pos, feature, -normal, normal
             )  # set the viewing directions to the normal to get "albedo"
             mesh["v_rgb"] = rgb.cpu()
         return mesh

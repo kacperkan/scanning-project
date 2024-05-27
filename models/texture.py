@@ -29,6 +29,8 @@ class VolumeRadiance(nn.Module):
         self.network = network
 
     def forward(self, features, dirs, *args):
+        if features.shape[0] == 0:
+            return torch.zeros(0, self.n_output_dims, device=dirs.device)
         dirs = (dirs + 1.0) / 2.0  # (-1, 1) => (0, 1)
         dirs_embd = self.encoding(dirs.view(-1, self.n_dir_dims))
         network_inp = torch.cat(
@@ -76,6 +78,59 @@ class VolumeColor(nn.Module):
         if "color_activation" in self.config:
             color = get_activation(self.config.color_activation)(color)
         return color
+
+    def regularizations(self, out):
+        return {}
+
+
+@models.register("bcc-radiance")
+class BCCRadiance(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.n_dir_dims = self.config.get("n_dir_dims", 3)
+        self.n_output_dims = 3
+        view_encoding = get_encoding(
+            self.n_dir_dims, self.config.dir_encoding_config
+        )
+        pos_encoding = get_encoding(3, self.config.pos_encoding_config)
+        self.n_input_dims = (
+            self.config.input_feature_dim
+            + view_encoding.n_output_dims
+            + pos_encoding.n_output_dims
+        )
+        network = get_mlp(
+            self.n_input_dims,
+            self.n_output_dims,
+            self.config.mlp_network_config,
+        )
+        self.pos_encoding = pos_encoding
+        self.view_encoding = view_encoding
+        self.network = network
+
+    def forward(self, xyz, features, dirs, *args):
+        if features.shape[0] == 0:
+            return torch.zeros(0, self.n_output_dims, device=dirs.device)
+        dirs = (dirs + 1.0) / 2.0  # (-1, 1) => (0, 1)
+        dirs_embd = self.view_encoding(dirs.view(-1, self.n_dir_dims))
+        pos_embd = self.pos_encoding(xyz.view(-1, 3))
+        network_inp = torch.cat(
+            [features.view(-1, features.shape[-1]), dirs_embd, pos_embd]
+            + [arg.view(-1, arg.shape[-1]) for arg in args],
+            dim=-1,
+        )
+        color = (
+            self.network(network_inp)
+            .view(*features.shape[:-1], self.n_output_dims)
+            .float()
+        )
+        if "color_activation" in self.config:
+            color = get_activation(self.config.color_activation)(color)
+        return color
+
+    def update_step(self, epoch, global_step):
+        update_module_step(self.pos_encoding, epoch, global_step)
+        update_module_step(self.view_encoding, epoch, global_step)
 
     def regularizations(self, out):
         return {}

@@ -1,19 +1,15 @@
 import math
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from nerfacc import (
-    ContractionType,
-    OccupancyGrid,
+    OccGridEstimator,
     accumulate_along_rays,
-    ray_marching,
     render_weight_from_density,
 )
 
 import models
 from models.base import BaseModel
-from models.utils import chunk_batch
+from models.utils import ContractionType, chunk_batch
 from systems.utils import update_module_step
 
 
@@ -69,10 +65,8 @@ class NeRFModel(BaseModel):
         self.geometry.contraction_type = self.contraction_type
 
         if self.config.grid_prune:
-            self.occupancy_grid = OccupancyGrid(
-                roi_aabb=self.scene_aabb,
-                resolution=self.occupancy_grid_res,
-                contraction_type=self.contraction_type,
+            self.occupancy_grid = OccGridEstimator(
+                roi_aabb=self.scene_aabb, resolution=self.occupancy_grid_res
             )
         self.randomized = self.config.randomized
         self.background_color = None
@@ -87,7 +81,7 @@ class NeRFModel(BaseModel):
             return density[..., None] * self.render_step_size
 
         if self.training and self.config.grid_prune:
-            self.occupancy_grid.every_n_step(
+            self.occupancy_grid.update_every_n_steps(
                 step=global_step, occ_eval_fn=occ_eval_fn
             )
 
@@ -103,30 +97,30 @@ class NeRFModel(BaseModel):
             ray_indices = ray_indices.long()
             t_origins = rays_o[ray_indices]
             t_dirs = rays_d[ray_indices]
-            positions = t_origins + t_dirs * (t_starts + t_ends) / 2.0
+            positions = (
+                t_origins + t_dirs * (t_starts + t_ends)[..., None] / 2.0
+            )
             density, _ = self.geometry(positions)
-            return density[..., None]
+            return density
 
         def rgb_sigma_fn(t_starts, t_ends, ray_indices):
             ray_indices = ray_indices.long()
             t_origins = rays_o[ray_indices]
             t_dirs = rays_d[ray_indices]
-            positions = t_origins + t_dirs * (t_starts + t_ends) / 2.0
+            positions = (
+                t_origins + t_dirs * (t_starts + t_ends)[..., None] / 2.0
+            )
             density, feature = self.geometry(positions)
             rgb = self.texture(feature, t_dirs)
             return rgb, density[..., None]
 
         with torch.no_grad():
-            ray_indices, t_starts, t_ends = ray_marching(
+            ray_indices, t_starts, t_ends = self.occupancy_grid.sampling(
                 rays_o,
                 rays_d,
-                scene_aabb=(
-                    None if self.config.learned_background else self.scene_aabb
-                ),
-                grid=self.occupancy_grid if self.config.grid_prune else None,
                 sigma_fn=sigma_fn,
-                near_plane=self.near_plane,
-                far_plane=self.far_plane,
+                near_plane=self.near_plane if self.near_plane else 0.0,
+                far_plane=self.far_plane if self.far_plane else 1e8,
                 render_step_size=self.render_step_size,
                 stratified=self.randomized,
                 cone_angle=self.cone_angle,
@@ -136,28 +130,35 @@ class NeRFModel(BaseModel):
         ray_indices = ray_indices.long()
         t_origins = rays_o[ray_indices]
         t_dirs = rays_d[ray_indices]
-        midpoints = (t_starts + t_ends) / 2.0
+        midpoints = (t_starts + t_ends)[..., None] / 2.0
         positions = t_origins + t_dirs * midpoints
         intervals = t_ends - t_starts
+        intervals = intervals[..., None]
 
         density, feature = self.geometry(positions)
         rgb = self.texture(feature, t_dirs)
 
-        weights = render_weight_from_density(
+        weights, _, _ = render_weight_from_density(
             t_starts,
             t_ends,
-            density[..., None],
+            density,
             ray_indices=ray_indices,
             n_rays=n_rays,
         )
         opacity = accumulate_along_rays(
-            weights, ray_indices, values=None, n_rays=n_rays
+            weights=weights,
+            ray_indices=ray_indices,
+            values=None,
+            n_rays=n_rays,
         )
         depth = accumulate_along_rays(
-            weights, ray_indices, values=midpoints, n_rays=n_rays
+            weights=weights,
+            ray_indices=ray_indices,
+            values=midpoints,
+            n_rays=n_rays,
         )
         comp_rgb = accumulate_along_rays(
-            weights, ray_indices, values=rgb, n_rays=n_rays
+            weights=weights, ray_indices=ray_indices, values=rgb, n_rays=n_rays
         )
         comp_rgb = comp_rgb + self.background_color * (1.0 - opacity)
 

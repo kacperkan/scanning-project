@@ -1,11 +1,17 @@
 import sys
 import warnings
 from bisect import bisect_right
+from typing import cast
 
+import networkx as nx
 import torch
 import torch.nn as nn
+import trimesh
+from jaxtyping import Float
 from pytorch_lightning.utilities.rank_zero import rank_zero_debug
 from torch.optim import lr_scheduler
+
+from models.utils import yet_another_meshing
 
 
 class ChainedScheduler(lr_scheduler._LRScheduler):
@@ -36,10 +42,9 @@ class ChainedScheduler(lr_scheduler._LRScheduler):
         for scheduler_idx in range(1, len(schedulers)):
             if schedulers[scheduler_idx].optimizer != schedulers[0].optimizer:
                 raise ValueError(
-                    "ChainedScheduler expects all schedulers to belong to the same optimizer, but "
-                    "got schedulers at index {} and {} to be different".format(
-                        0, scheduler_idx
-                    )
+                    "ChainedScheduler expects all schedulers to belong to the"
+                    " same optimizer, but got schedulers at index {} and {} to"
+                    " be different".format(0, scheduler_idx)
                 )
         self._schedulers = list(schedulers)
         self.optimizer = optimizer
@@ -115,18 +120,16 @@ class SequentialLR(lr_scheduler._LRScheduler):
         for scheduler_idx in range(1, len(schedulers)):
             if schedulers[scheduler_idx].optimizer != schedulers[0].optimizer:
                 raise ValueError(
-                    "Sequential Schedulers expects all schedulers to belong to the same optimizer, but "
-                    "got schedulers at index {} and {} to be different".format(
-                        0, scheduler_idx
-                    )
+                    "Sequential Schedulers expects all schedulers to belong to"
+                    " the same optimizer, but got schedulers at index {} and"
+                    " {} to be different".format(0, scheduler_idx)
                 )
         if len(milestones) != len(schedulers) - 1:
             raise ValueError(
-                "Sequential Schedulers expects number of schedulers provided to be one more "
-                "than the number of milestone points, but got number of schedulers {} and the "
-                "number of milestones to be equal to {}".format(
-                    len(schedulers), len(milestones)
-                )
+                "Sequential Schedulers expects number of schedulers provided"
+                " to be one more than the number of milestone points, but got"
+                " number of schedulers {} and the number of milestones to be"
+                " equal to {}".format(len(schedulers), len(milestones))
             )
         self._schedulers = schedulers
         self._milestones = milestones
@@ -216,7 +219,8 @@ class ConstantLR(lr_scheduler._LRScheduler):
     ):
         if factor > 1.0 or factor < 0:
             raise ValueError(
-                "Constant multiplicative factor expected to be between 0 and 1."
+                "Constant multiplicative factor expected to be between 0"
+                " and 1."
             )
 
         self.factor = factor
@@ -226,8 +230,10 @@ class ConstantLR(lr_scheduler._LRScheduler):
     def get_lr(self):
         if not self._get_lr_called_within_step:
             warnings.warn(
-                "To get the last learning rate computed by the scheduler, "
-                "please use `get_last_lr()`.",
+                (
+                    "To get the last learning rate computed by the scheduler, "
+                    "please use `get_last_lr()`."
+                ),
                 UserWarning,
             )
 
@@ -303,7 +309,8 @@ class LinearLR(lr_scheduler._LRScheduler):
     ):
         if start_factor > 1.0 or start_factor < 0:
             raise ValueError(
-                "Starting multiplicative factor expected to be between 0 and 1."
+                "Starting multiplicative factor expected to be between 0"
+                " and 1."
             )
 
         if end_factor > 1.0 or end_factor < 0:
@@ -319,8 +326,10 @@ class LinearLR(lr_scheduler._LRScheduler):
     def get_lr(self):
         if not self._get_lr_called_within_step:
             warnings.warn(
-                "To get the last learning rate computed by the scheduler, "
-                "please use `get_last_lr()`.",
+                (
+                    "To get the last learning rate computed by the scheduler, "
+                    "please use `get_last_lr()`."
+                ),
                 UserWarning,
             )
 
@@ -400,6 +409,8 @@ def parse_optimizer(config, model):
         import apex
 
         optim = getattr(apex.optimizers, config.name)(params, **config.args)
+    elif config.name in ["AdamUniform"]:
+        optim = AdamUniform(params, **config.args)
     else:
         optim = getattr(torch.optim, config.name)(params, **config.args)
     return optim
@@ -441,3 +452,167 @@ def parse_scheduler(config, optimizer):
 def update_module_step(m, epoch, global_step):
     if hasattr(m, "update_step"):
         m.update_step(epoch, global_step)
+
+
+class AdamUniform(torch.optim.Optimizer):
+    """
+    Variant of Adam with uniform scaling by the second moment.
+
+    Instead of dividing each component by the square root of its second moment,
+    we divide all of them by the max.
+    """
+
+    def __init__(self, params, lr=0.1, betas=(0.9, 0.999), eps=1e-8):
+        defaults = dict(lr=lr, betas=betas, eps=eps)
+        super(AdamUniform, self).__init__(params, defaults)
+
+        self.verts = None
+        self.one_ring_array_indices = None
+        self.two_ring_array_indices = None
+        self.central_nodes = None
+        self.verts_one_ring = None
+        self.verts_two_ring = None
+        self.verts_central_nodes = None
+        self.one_ring_mask = None
+
+    def __setstate__(self, state):
+        super(AdamUniform, self).__setstate__(state)
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            if group["name"] == "geometry":
+                self._create_mesh_structures(group["params"][0])
+            lr = group["lr"]
+            b1, b2 = group["betas"]
+            eps = group["eps"]
+            for p in group["params"]:
+                state = self.state[p]
+                # Lazy initialization
+                if len(state) == 0:
+                    state["step"] = 0
+                    state["g1"] = torch.zeros_like(p.data)
+                    state["g2"] = torch.zeros_like(p.data)
+
+                g1 = state["g1"]
+                g2 = state["g2"]
+                state["step"] += 1
+                grad = p.grad.data
+
+                g1.mul_(b1).add_(grad, alpha=1 - b1)
+                g2.mul_(b2).add_(grad.square(), alpha=1 - b2)
+                m1 = g1 / (1 - (b1 ** state["step"]))
+                m2 = g2 / (1 - (b2 ** state["step"]))
+                # This is the only modification we make to the original Adam
+                # algorithm
+                if m2.numel() >= 1:
+                    gr = m1 / (eps + m2.sqrt().max())
+                else:
+                    gr = m1 / (eps + m2.sqrt())
+
+                if group["name"] == "geometry":
+                    self.calculate_average(gr)
+                p.data.sub_(gr, alpha=lr)
+
+    def _create_mesh_structures(self, grid: torch.Tensor):
+        if self.verts is not None:
+            return
+        resolution = int(grid.shape[0] ** (1 / 3))
+        verts, faces = yet_another_meshing(resolution)
+        mesh = trimesh.Trimesh(
+            vertices=verts.cpu().numpy(),
+            faces=faces.cpu().numpy(),
+            process=False,
+        )
+
+        graph = nx.from_edgelist(mesh.edges_unique)
+        two_ring = []
+        one_ring = []
+        max_len_two_ring = -1
+        max_len_one_ring = -1
+        for i in range(len(mesh.vertices)):
+            ring = list(graph[i].keys())
+
+            single_two_ring = [
+                subelem for elem in ring for subelem in graph[elem].keys()
+            ]
+            two_ring.append(list(sorted(list(set(single_two_ring)))))
+            one_ring.append(ring)
+            max_len_one_ring = max(max_len_one_ring, len(ring))
+            max_len_two_ring = max(max_len_two_ring, len(two_ring[-1]))
+
+        padded_one_ring = []
+        padded_two_ring = []
+        for o_ring, t_ring in zip(one_ring, two_ring):
+            padded_one_ring.append(
+                o_ring + [-1] * (max_len_one_ring - len(o_ring))
+            )
+            padded_two_ring.append(
+                t_ring + [-1] * (max_len_two_ring - len(t_ring))
+            )
+        central_nodes = torch.tensor(
+            list(graph.nodes), dtype=torch.long, device=grid.device
+        )
+        one_ring_array_indices = torch.tensor(
+            padded_one_ring, dtype=torch.long, device=grid.device
+        )
+        two_ring_array_indices = torch.tensor(
+            padded_two_ring, dtype=torch.long, device=grid.device
+        )
+
+        verts = verts.to(grid.device)
+
+        verts_one_ring = verts[one_ring_array_indices]
+        verts_two_ring = verts[two_ring_array_indices]
+        verts_central_nodes = verts[central_nodes]
+        self.verts = verts.to(grid.device).long()
+        self.one_ring_array_indices = one_ring_array_indices.to(grid.device)
+        self.two_ring_array_indices = two_ring_array_indices.to(grid.device)
+        self.central_nodes = central_nodes.to(grid.device)
+        self.verts_one_ring = verts_one_ring.to(grid.device).long()
+        self.verts_two_ring = verts_two_ring.to(grid.device).long()
+        self.verts_central_nodes = verts_central_nodes.to(grid.device).long()
+        self.one_ring_mask = (
+            (one_ring_array_indices != -1).float().unsqueeze(dim=-1)
+        ).to(grid.device)
+
+    def calculate_average(self, gradient: torch.Tensor) -> torch.Tensor:
+        original_shape = gradient.shape[0]
+        dim = int(round(gradient.shape[0] ** (1 / 3)))
+        gradient = gradient.view((dim, dim, dim, -1))
+        if (
+            self.verts is None
+            or self.one_ring_array_indices is None
+            or self.two_ring_array_indices is None
+        ):
+            self._create_mesh_structures()
+        verts_one_ring = self.verts_one_ring
+        verts_central_nodes = self.verts_central_nodes
+        one_ring_mask = self.one_ring_mask
+
+        def extract_from_coords(
+            coords: Float[torch.Tensor, "... 3"],
+        ) -> Float[torch.Tensor, "... dim"]:
+            xs, ys, zs = [
+                elem.squeeze(dim=-1) for elem in coords.split(1, dim=-1)
+            ]
+            sdfs = torch.zeros_like(
+                tuple(coords.shape[:-1]) + (gradient.shape[-1],)
+            )
+
+            sdfs = gradient[xs, ys, zs]
+            return sdfs
+
+        one_ring_sdfs = extract_from_coords(verts_one_ring)
+        # two_ring_sdfs = extract_from_coords(verts_two_ring)
+        center_sdfs = extract_from_coords(verts_central_nodes)
+        # two_ring_mask = (two_ring_array_indices != -1).float()
+
+        one_ring_mask = self.one_ring_mask
+
+        new_grad = (one_ring_sdfs * one_ring_mask).sum(
+            dim=-2
+        ) + one_ring_mask.sum(dim=-2) * center_sdfs
+        new_grad = new_grad / (one_ring_mask.sum(dim=-2) + 1)
+        new_grad = new_grad.view(original_shape)
+        return new_grad

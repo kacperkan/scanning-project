@@ -179,9 +179,10 @@ class NeuSSystem(BaseSystem):
         loss += loss_sparsity * self.C(self.config.system.loss.lambda_sparsity)
 
         if self.C(self.config.system.loss.lambda_curvature) > 0:
-            assert (
-                "sdf_laplace_samples" in out
-            ), "Need geometry.grad_type='finite_difference' to get SDF Laplace samples"
+            assert "sdf_laplace_samples" in out, (
+                "Need geometry.grad_type='finite_difference' to get SDF"
+                " Laplace samples"
+            )
             loss_curvature = out["sdf_laplace_samples"].abs().mean()
             self.log("train/loss_curvature", loss_curvature)
             loss += loss_curvature * self.C(
@@ -201,6 +202,27 @@ class NeuSSystem(BaseSystem):
             loss += loss_distortion * self.C(
                 self.config.system.loss.lambda_distortion
             )
+
+        if (
+            loss_weight := self.C(
+                self.config.system.loss.lambda_laplacian_smoothness
+            )
+        ) > 0:
+            assert "sdf_laplace_samples" in out, (
+                "Need geometry.grad_type='finite_difference' to get SDF"
+                " Laplace samples"
+            )
+            time_step = 0.1
+
+            diffused_sdf = (
+                out["sdf_samples"] + time_step * out["sdf_laplace_samples"]
+            )
+
+            laplacian_loss = (
+                (out["sdf_samples"] - diffused_sdf).pow(2.0).mean()
+            )
+            self.log("train/laplacian_smoothing_loss", laplacian_loss)
+            loss += laplacian_loss * loss_weight
 
         if (
             self.config.model.learned_background
@@ -294,7 +316,10 @@ class NeuSSystem(BaseSystem):
                 },
             ],
         )
-        return {"psnr": psnr, "index": batch["index"]}
+
+        self.__validation_outputs.append(
+            {"psnr": psnr, "index": batch["index"]}
+        )
 
     """
     # aggregate outputs from different devices when using DP
@@ -302,8 +327,11 @@ class NeuSSystem(BaseSystem):
         pass
     """
 
-    def validation_epoch_end(self, out):
-        out = self.all_gather(out)
+    def on_validation_epoch_start(self):
+        self.__validation_outputs = []
+
+    def on_validation_epoch_end(self):
+        out = self.all_gather(self.__validation_outputs)
         if self.trainer.is_global_zero:
             out_set = {}
             for step_out in out:
@@ -322,6 +350,7 @@ class NeuSSystem(BaseSystem):
                 torch.stack([o["psnr"] for o in out_set.values()])
             )
             self.log("val/psnr", psnr, prog_bar=True, rank_zero_only=True)
+        self.__validation_outputs.clear()
 
     def test_step(self, batch, batch_idx):
         out = self(batch)
@@ -372,14 +401,17 @@ class NeuSSystem(BaseSystem):
                 },
             ],
         )
-        return {"psnr": psnr, "index": batch["index"]}
+        self.__test_outputs.append({"psnr": psnr, "index": batch["index"]})
 
-    def test_epoch_end(self, out):
+    def on_test_epoch_start(self):
+        self.__test_outputs = []
+
+    def on_test_epoch_end(self):
         """
         Synchronize devices.
         Generate image sequence using test outputs.
         """
-        out = self.all_gather(out)
+        out = self.all_gather(self.__test_outputs)
         if self.trainer.is_global_zero:
             out_set = {}
             for step_out in out:
@@ -408,6 +440,8 @@ class NeuSSystem(BaseSystem):
             )
 
             self.export()
+
+        self.__test_outputs.clear()
 
     def export(self):
         mesh = self.model.export(self.config.export)
