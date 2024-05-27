@@ -150,3 +150,7 @@ exp/
 runs/
 load/
 extern/
+.vscode
+.mypy
+
+*.obj
