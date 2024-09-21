@@ -18,16 +18,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Optional, Type
-from typing_extensions import Literal
 
 import numpy as np
 import torch
 from PIL import Image
 from rich.console import Console
 from torchtyping import TensorType
+from typing_extensions import Literal
 
 from nerfstudio.cameras import camera_utils
-from nerfstudio.cameras.cameras import Cameras, CameraType
+from nerfstudio.cameras.cameras import CAMERA_MODEL_TO_TYPE, Cameras, CameraType
 from nerfstudio.data.dataparsers.base_dataparser import (
     DataParser,
     DataParserConfig,
@@ -206,6 +206,11 @@ class SDFStudio(DataParser):
             if self.config.train_val_no_overlap:
                 indices = [i for i in indices if i % self.config.skip_every_for_val_split != 0]
         # print(split, indices)
+        distort_fixed = False
+        for distort_key in ["k1", "k2", "k3", "p1", "p2"]:
+            if distort_key in meta:
+                distort_fixed = True
+                break
 
         image_filenames = []
         depth_images = []
@@ -217,6 +222,7 @@ class SDFStudio(DataParser):
         fy = []
         cx = []
         cy = []
+        distort = []
         camera_to_worlds = []
         for i, frame in enumerate(meta["frames"]):
             image_filename = self.config.data / frame["rgb_path"]
@@ -291,6 +297,18 @@ class SDFStudio(DataParser):
             cy.append(intrinsics[1, 2])
             camera_to_worlds.append(camtoworld)
 
+            if not distort_fixed:
+                distort.append(
+                    camera_utils.get_distortion_params(
+                        k1=float(meta["k1"]) if "k1" in meta else 0.0,
+                        k2=float(meta["k2"]) if "k2" in meta else 0.0,
+                        k3=float(meta["k3"]) if "k3" in meta else 0.0,
+                        k4=float(meta["k4"]) if "k4" in meta else 0.0,
+                        p1=float(meta["p1"]) if "p1" in meta else 0.0,
+                        p2=float(meta["p2"]) if "p2" in meta else 0.0,
+                    )
+                )
+
         fx = torch.stack(fx)
         fy = torch.stack(fy)
         cx = torch.stack(cx)
@@ -342,6 +360,24 @@ class SDFStudio(DataParser):
         )
 
         height, width = meta["height"], meta["width"]
+        idx_tensor = torch.tensor(indices, dtype=torch.long)
+        if distort_fixed:
+            distortion_params = camera_utils.get_distortion_params(
+                k1=float(meta["k1"]) if "k1" in meta else 0.0,
+                k2=float(meta["k2"]) if "k2" in meta else 0.0,
+                k3=float(meta["k3"]) if "k3" in meta else 0.0,
+                k4=float(meta["k4"]) if "k4" in meta else 0.0,
+                p1=float(meta["p1"]) if "p1" in meta else 0.0,
+                p2=float(meta["p2"]) if "p2" in meta else 0.0,
+            )
+        else:
+            distortion_params = torch.stack(distort, dim=0)[idx_tensor]
+
+        if "camera_model" in meta:
+            camera_type = CAMERA_MODEL_TO_TYPE[meta["camera_model"]]
+        else:
+            camera_type = CameraType.PERSPECTIVE
+
         cameras = Cameras(
             fx=fx[indices],
             fy=fy[indices],
@@ -350,7 +386,8 @@ class SDFStudio(DataParser):
             height=height,
             width=width,
             camera_to_worlds=camera_to_worlds[indices, :3, :4],
-            camera_type=CameraType.PERSPECTIVE,
+            camera_type=camera_type,
+            distortion_params=distortion_params,
         )
 
         # TODO supports downsample

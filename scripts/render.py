@@ -123,6 +123,9 @@ class RenderTrajectory:
     # Specifies number of rays per chunk during eval.
     eval_num_rays_per_chunk: Optional[int] = None
 
+    # Reverse cameras for the dataset from scanning
+    reverse_cameras: bool = False
+
     def main(self) -> None:
         """Main function."""
         _, pipeline, _ = eval_setup(

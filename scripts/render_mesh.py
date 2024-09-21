@@ -77,6 +77,8 @@ def _render_trajectory_video(
     seconds: float = 5.0,
     output_format: Literal["images", "video"] = "video",
     merge_type: Literal["half", "concat"] = "half",
+    reverse_mesh: bool = False,
+    is_agisoft: bool = False,
 ) -> None:
     """Helper function to create a video of the spiral trajectory.
 
@@ -88,6 +90,8 @@ def _render_trajectory_video(
         rendered_resolution_scaling_factor: Scaling factor to apply to the camera image resolution.
         seconds: Length of output video.
         output_format: How to save output data.
+        reverse_mesh: Whether to reverse the mesh from the scanning dataset.
+        is_agisoft: Whether the mesh is from Agisoft.
     """
     CONSOLE.print("[bold green]Creating trajectory video")
     images = []
@@ -98,6 +102,34 @@ def _render_trajectory_video(
     height = cameras[0].height[0].item()
 
     ply = o3d.io.read_triangle_mesh(str(meshfile))
+    if reverse_mesh:
+        verts = np.array(ply.vertices)
+        R = ply.get_rotation_matrix_from_xyz((0, np.pi / 2, 0.0))
+        print(np.array(ply.vertices).mean(axis=0))
+
+        if is_agisoft:
+            ply = ply.translate(-np.array(ply.vertices).mean(axis=0))
+            a_max = np.abs(np.array(ply.vertices)).max()
+            a_min = np.abs(np.array(ply.vertices)).min()
+            ply = ply.scale(1 / (a_max - a_min) * 0.125, center=(0.0, 0.0, 0.0))
+        else:
+            a_max = np.abs(np.array(ply.vertices)).max()
+            a_min = np.abs(np.array(ply.vertices)).min()
+            ply = ply.scale(1 / (a_max - a_min) * 0.5, center=(0.0, 0.0, 0.0))
+            # ply = ply.scale(0.5, center=(0.0, 0.0, 0.0))
+        ply = ply.rotate(R, center=(0, 0, 0))
+
+        if is_agisoft:
+            ply = ply.translate(-np.array(ply.vertices).mean(axis=0))
+            transformation = np.eye(4)
+
+            transformation[0, 0] = -1.0
+            transformation[2, 2] = -1.0
+            ply = ply.transform(transformation)
+            R = ply.get_rotation_matrix_from_xyz((0.0, 0.0, -np.pi * 0.65))
+            ply = ply.rotate(R, center=(0, 0, 0))
+        print(np.array(ply.vertices).mean(axis=0))
+
     ply.compute_vertex_normals()
     ply.paint_uniform_color([1, 1, 1])
 
@@ -207,6 +239,10 @@ class RenderTrajectory:
     output_format: Literal["images", "video"] = "video"
     merge_type: Literal["half", "concat"] = "half"
 
+    # Applied for the scanning dataset where cameras are oriented weirdly
+    reverse_cameras: bool = False
+    is_agisoft: bool = False
+
     data: AnnotatedDataParserUnion = SDFStudioDataParserConfig()
     num_views: int = 300
 
@@ -226,15 +262,21 @@ class RenderTrajectory:
         elif self.traj == "interpolate":
             # load training data and interpolate path
             outputs = self.data.setup()._generate_dataparser_outputs()
-            camera_path = _interpolate_trajectory(cameras=outputs.cameras, num_views=self.num_views)
+            cameras = reverse_cams(outputs.cameras) if self.reverse_cameras else outputs.cameras
+            camera_path = _interpolate_trajectory(cameras=cameras, num_views=self.num_views)
+            center_cams(camera_path)
             seconds = camera_path.size / 24
         elif self.traj == "spiral":
             outputs = self.data.setup()._generate_dataparser_outputs()
-            camera_path = get_spiral_path(camera=outputs.cameras, steps=self.num_views, radius=1.0)
+            cameras = reverse_cams(outputs.cameras) if self.reverse_cameras else outputs.cameras
+            camera_path = get_spiral_path(camera=cameras, steps=self.num_views, radius=1.0)
+            center_cams(camera_path)
             seconds = camera_path.size / 24
         elif self.traj == "ellipse":
             outputs = self.data.setup()._generate_dataparser_outputs()
-            camera_path = generate_ellipse_path(cameras=outputs.cameras, n_frames=self.num_views, const_speed=False)
+            cameras = reverse_cams(outputs.cameras) if self.reverse_cameras else outputs.cameras
+            camera_path = generate_ellipse_path(cameras=cameras, n_frames=self.num_views, const_speed=False)
+            center_cams(camera_path)
             seconds = camera_path.size / self.fps
         else:
             assert_never(self.traj)
@@ -248,7 +290,27 @@ class RenderTrajectory:
             seconds=seconds,
             output_format=self.output_format,
             merge_type=self.merge_type,
+            reverse_mesh=self.reverse_cameras,
+            is_agisoft=self.is_agisoft,
         )
+
+
+def reverse_cams(cameras):
+    for cam in cameras:
+        cam.camera_to_worlds[:, 1] *= -1
+        cam.camera_to_worlds[[1, 2]] = cam.camera_to_worlds[[2, 1]]
+        # cam.camera_to_worlds[:, [1, 2]] = cam.camera_to_worlds[:, [2, 1]]
+    return cameras
+
+
+def center_cams(cameras):
+    translations = []
+    for cam in cameras:
+        translations.append(cam.camera_to_worlds[:3, 3])
+    mean = torch.stack(translations).mean(dim=0)
+    for cam in cameras:
+        cam.camera_to_worlds[:3, 3] -= mean
+    return cameras
 
 
 def entrypoint():

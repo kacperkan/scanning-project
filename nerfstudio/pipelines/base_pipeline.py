@@ -298,6 +298,7 @@ class VanillaPipeline(Pipeline):
         return model_outputs, loss_dict, metrics_dict
 
     @profiler.time_function
+    @torch.no_grad()
     def get_eval_image_metrics_and_images(self, step: int):
         """This function gets your evaluation loss dict. It needs to get the data
         from the DataManager and feed it to the model's forward function
@@ -318,6 +319,7 @@ class VanillaPipeline(Pipeline):
         return metrics_dict, images_dict
 
     @profiler.time_function
+    @torch.no_grad()
     def get_average_eval_image_metrics(self, step: Optional[int] = None):
         """Iterate over all the images in the eval dataset and get the average.
 
@@ -368,6 +370,7 @@ class VanillaPipeline(Pipeline):
         return metrics_dict, images_dict_list
 
     @profiler.time_function
+    @torch.no_grad()
     def get_visibility_mask(
         self,
         coarse_grid_resolution: int = 512,

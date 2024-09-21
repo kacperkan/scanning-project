@@ -152,7 +152,9 @@ class Trainer:
 
                     # training callbacks after the training iteration
                     for callback in self.callbacks:
-                        callback.run_callback_at_location(step, location=TrainingCallbackLocation.AFTER_TRAIN_ITERATION)
+                        callback.run_callback_at_location(
+                            step, location=TrainingCallbackLocation.AFTER_TRAIN_ITERATION
+                        )
 
                 # Skip the first two steps to avoid skewed timings that break the viewer rendering speed estimate.
                 if step > 1:
@@ -289,9 +291,11 @@ class Trainer:
         torch.save(
             {
                 "step": step,
-                "pipeline": self.pipeline.module.state_dict()  # type: ignore
-                if hasattr(self.pipeline, "module")
-                else self.pipeline.state_dict(),
+                "pipeline": (
+                    self.pipeline.module.state_dict()  # type: ignore
+                    if hasattr(self.pipeline, "module")
+                    else self.pipeline.state_dict()
+                ),
                 "optimizers": {k: v.state_dict() for (k, v) in self.optimizers.optimizers.items()},
                 "schedulers": {k: v.state_dict() for (k, v) in self.optimizers.schedulers.items()},
                 "scalers": self.grad_scaler.state_dict(),
@@ -329,6 +333,7 @@ class Trainer:
 
     @check_eval_enabled
     @profiler.time_function
+    @torch.no_grad()
     def eval_iteration(self, step):
         """Run one iteration with different batch/image/all image evaluations depending on step size.
 
